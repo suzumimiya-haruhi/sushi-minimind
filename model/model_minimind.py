@@ -25,7 +25,7 @@ class MiniMindConfig(PretrainedConfig):
 
 class RMSNorm(torch.nn.Module):
     """
-    RMSNorm归一化，均方根缩放，乘可学习参数，不减去均值
+    RMSNorm归一化，均方根缩放，乘可学习参数，不用方差，不减去均值
     """
 
     def __init__(self, dim: int, eps: float = 1e-5):
@@ -90,4 +90,39 @@ def precompute_freqs_cid(dim: int, end: int = int(32 * 1024), rope_base: float =
     # [a,b,c,d,e,f]分为[a,d]\[b,e]\[c,f],旋转，所以freqs还原成dim维度直接在dim=-1拼接
     freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor  # 乘注意力分数
     freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
+    # return的结果应该是处理单个头的二维张量[seq_len,head_dim]
     return freqs_cos, freqs_sin
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+    """
+    1、把位置编码应用在qk上，处理所有头
+    2、二维平面RoPE([x1,x2])=[x1,x2]*cos + [-x2,x1]*sin
+        q和k的维度是[batch_size,num_heads,seq_len,head_dim]:分别是批次方向，头数，token方向，每个头的隐藏层维度（是词向量方向）
+        这里需要处理的是H维度
+    3、传入的cos、sin应该有三个维度[batch_size,seq_len,head_dim]
+        所以需要在传入前做cos = cos[None, :, :]   # 等价 cos.unsqueeze(0)
+    4、... 代表一连串的 :   仅处理H时写成[...,H]
+    5、* 是哈达玛积，相同位置元素相乘，@是矩阵乘法
+    """
+    def rotatle_half(x):
+        """
+        传入q或者k，把H维度从[x1,x2]转换成[-x2,x1]
+        [a,b,c,d,e,f] -> [-d,-e,-f,a,b,c]
+        """
+        return torch.cat([-x[...,x.shape[-1]//2:],x[...,:x.shape[-1]//2]],dim=-1)
+        # torch.cat的序列参数（第一个参数）可以用元组或列表
+    cos = cos.unsqueeze(unsqueeze_dim)  # 在维度1的位置插入一个维度，把[B,L,D]变成[B,H,L,D]
+    sin = sin.unsqueeze(unsqueeze_dim)
+    """
+    哈达玛积广播：
+    只有要广播的维度有一方维度数是1才能广播，其他情况都不行
+    张量 1：[B, 1, L, D]，张量 2：[1, H, L, D] 可以广播
+    张量 1：[1, 2, L, D]，张量 2：[B, H, L, D] 不能广播
+    """
+    q_embed = ((q * cos ) + (rotatle_half(q) * sin)).to(q.dtype)
+    k_embed = ((k * cos ) + (rotatle_half(k) * sin)).to(k.dtype)
+    # tensor.to(q.dtype) : 把张量数据类型转换成q中元素的数据类型
+    # tensor.type_as(x) : 转换元素类型和所在设备，等价tensor.to(dtype=x.dtype, device=x.device)
+    # np_arr.astype(np.float32) : numpy转换元素类型
+    return q_embed, k_embed
