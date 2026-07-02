@@ -1,18 +1,42 @@
-import math
-
-import torch
-from transformers import PretrainedConfig
+import math, torch, torch.nn.functional as F
 from torch import nn
-
+from transformers.activations import ACT2FN
+from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
+from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 
 class MiniMindConfig(PretrainedConfig):
     """
-    MiniMind模型配置类
+    MiniMind 模型的配置类，用来保存网络结构、词表、位置编码、注意力头数、MoE 等超参数。
+    继承 Hugging Face 的 PretrainedConfig 后，模型可以使用 from_pretrained/save_pretrained 等方式加载和保存配置。
     """
-    model_type = 'minimind'
-
-    def __init__(self):
-        super().__init__()
+    model_type = "minimind"
+    def __init__(self, hidden_size=768, num_hidden_layers=8, use_moe=False, **kwargs):
+        """
+        初始化 MiniMind 的所有超参数。
+        关键维度关系：head_dim = hidden_size / num_attention_heads。
+        默认前馈网络中间层大小近似为 ceil(hidden_size * pi / 64) * 64，用 64 对齐方便计算。
+        当 inference_rope_scaling=True 时启用 YaRN 风格的 RoPE 扩展配置。
+        MoE 相关参数只在 use_moe=True 时被后续网络实际使用。
+        """
+        super().__init__(**kwargs)
+        self.hidden_size = hidden_size
+        self.num_hidden_layers = num_hidden_layers
+        self.use_moe = use_moe
+        self.dropout = kwargs.get("dropout", 0.0)
+        self.vocab_size = kwargs.get("vocab_size", 6400)
+        self.bos_token_id = kwargs.get("bos_token_id", 1)
+        self.eos_token_id = kwargs.get("eos_token_id", 2)
+        self.flash_attn = kwargs.get("flash_attn", True)
+        self.num_attention_heads = kwargs.get("num_attention_heads", 8)
+        self.num_key_value_heads = kwargs.get("num_key_value_heads", 4)
+        self.head_dim = kwargs.get("head_dim", self.hidden_size // self.num_attention_heads)
+        self.hidden_act = kwargs.get("hidden_act", 'silu')
+        self.intermediate_size = kwargs.get("intermediate_size", math.ceil(hidden_size * math.pi / 64) * 64)
+        self.max_position_embeddings = kwargs.get("max_position_embeddings", 32768)
+        self.rms_norm_eps = kwargs.get("rms_norm_eps", 1e-6)
+        self.rope_theta = kwargs.get("rope_theta", 1e6)
+        self.tie_word_embeddings = kwargs.get("tie_word_embeddings", True)
+        self.inference_rope_scaling = kwargs.get("inference_rope_scaling", False)
         self.rope_scaling = {
             "beta_fast": 32,
             "beta_slow": 1,
@@ -21,6 +45,12 @@ class MiniMindConfig(PretrainedConfig):
             "attention_factor": 1.0,
             "type": "yarn"
         } if self.inference_rope_scaling else None  # YaRN缩放参数，在后训练、微调、推理时都应传入
+        self.num_experts = kwargs.get("num_experts", 4)
+        self.num_experts_per_tok = kwargs.get("num_experts_per_tok", 1)
+        self.moe_intermediate_size = kwargs.get("moe_intermediate_size", self.intermediate_size)
+        self.norm_topk_prob = kwargs.get("norm_topk_prob", True)
+        self.router_aux_loss_coef = kwargs.get("router_aux_loss_coef", 5e-4)
+
 
 
 class RMSNorm(torch.nn.Module):
@@ -126,3 +156,19 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     # tensor.type_as(x) : 转换元素类型和所在设备，等价tensor.to(dtype=x.dtype, device=x.device)
     # np_arr.astype(np.float32) : numpy转换元素类型
     return q_embed, k_embed
+
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    多个q头对应一个kv对，适配分组多头注意力GQA
+    所以把kv先复制成和q头一致
+    输入形状:[batch，seq_len,num_key_value_heads,head_dim]。
+    输出形状:[batch，seq_len, num_key_value_heads * n_rep，head_dim]。
+    """
+    bs, slen, num_key_value_heads, head_dim = x.shape
+    if n_rep == 1:
+        # 如果n_rep=1，则不需要复制，直接返回x
+        return x
+    return x[:, :, :, None, :].expand(bs, slen, num_key_value_heads, n_rep, head_dim).reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
+    # x[:, :, :, None, :]等价于x.unsqueeze(3),在第三维度增加一个维度，维度数为1
+    # .expand()以广播的形式把维度数为1的维度重复成n_rep，不复制节省内存
+
