@@ -4,12 +4,14 @@ from transformers.activations import ACT2FN
 from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
 from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 
+
 class MiniMindConfig(PretrainedConfig):
     """
     MiniMind 模型的配置类，用来保存网络结构、词表、位置编码、注意力头数、MoE 等超参数。
     继承 Hugging Face 的 PretrainedConfig 后，模型可以使用 from_pretrained/save_pretrained 等方式加载和保存配置。
     """
     model_type = "minimind"
+
     def __init__(self, hidden_size=768, num_hidden_layers=8, use_moe=False, **kwargs):
         """
         初始化 MiniMind 的所有超参数。
@@ -50,7 +52,6 @@ class MiniMindConfig(PretrainedConfig):
         self.moe_intermediate_size = kwargs.get("moe_intermediate_size", self.intermediate_size)
         self.norm_topk_prob = kwargs.get("norm_topk_prob", True)
         self.router_aux_loss_coef = kwargs.get("router_aux_loss_coef", 5e-4)
-
 
 
 class RMSNorm(torch.nn.Module):
@@ -110,10 +111,10 @@ def precompute_freqs_cid(dim: int, end: int = int(32 * 1024), rope_base: float =
             # 计算每个区域的缩放系数
             # torch.clamp(input, min=None, max=None, *, out=None)，把input截断
             # torch.arange(dim//2)为索引,可用max(high - low , 0.001)防止除以0
-            ramp = torch.clamp((torch.arange(dim // 2, device=freqs.device).float() - low) / (high - low), 0,1)
+            ramp = torch.clamp((torch.arange(dim // 2, device=freqs.device).float() - low) / (high - low), 0, 1)
             # 计算缩放后的频率
             # factor: 推理文本比训练最大长度的倍数，推理文本的长度上限的倍数，硬编为16
-            freqs = freqs * ((1 - ramp) + ramp /factor)
+            freqs = freqs * ((1 - ramp) + ramp / factor)
     t = torch.arange(end, device=freqs.device)
     freqs = torch.outer(t, freqs).float()  # 把token位置乘到频率上
     # 词向量方向分组旋转是前一半和后一半的对应位置分组旋转
@@ -135,13 +136,15 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     4、... 代表一连串的 :   仅处理H时写成[...,H]
     5、* 是哈达玛积，相同位置元素相乘，@是矩阵乘法
     """
+
     def rotatle_half(x):
         """
         传入q或者k，把H维度从[x1,x2]转换成[-x2,x1]
         [a,b,c,d,e,f] -> [-d,-e,-f,a,b,c]
         """
-        return torch.cat([-x[...,x.shape[-1]//2:],x[...,:x.shape[-1]//2]],dim=-1)
+        return torch.cat([-x[..., x.shape[-1] // 2:], x[..., :x.shape[-1] // 2]], dim=-1)
         # torch.cat的序列参数（第一个参数）可以用元组或列表
+
     cos = cos.unsqueeze(unsqueeze_dim)  # 在维度1的位置插入一个维度，把[B,L,D]变成[B,H,L,D]
     sin = sin.unsqueeze(unsqueeze_dim)
     """
@@ -150,12 +153,13 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     张量 1：[B, 1, L, D]，张量 2：[1, H, L, D] 可以广播
     张量 1：[1, 2, L, D]，张量 2：[B, H, L, D] 不能广播
     """
-    q_embed = ((q * cos ) + (rotatle_half(q) * sin)).to(q.dtype)
-    k_embed = ((k * cos ) + (rotatle_half(k) * sin)).to(k.dtype)
+    q_embed = ((q * cos) + (rotatle_half(q) * sin)).to(q.dtype)
+    k_embed = ((k * cos) + (rotatle_half(k) * sin)).to(k.dtype)
     # tensor.to(q.dtype) : 把张量数据类型转换成q中元素的数据类型
     # tensor.type_as(x) : 转换元素类型和所在设备，等价tensor.to(dtype=x.dtype, device=x.device)
     # np_arr.astype(np.float32) : numpy转换元素类型
     return q_embed, k_embed
+
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
@@ -168,7 +172,87 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     if n_rep == 1:
         # 如果n_rep=1，则不需要复制，直接返回x
         return x
-    return x[:, :, :, None, :].expand(bs, slen, num_key_value_heads, n_rep, head_dim).reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
+    return x[:, :, :, None, :].expand(bs, slen, num_key_value_heads, n_rep, head_dim).reshape(bs, slen,
+                                                                                              num_key_value_heads * n_rep,
+                                                                                              head_dim)
     # x[:, :, :, None, :]等价于x.unsqueeze(3),在第三维度增加一个维度，维度数为1
     # .expand()以广播的形式把维度数为1的维度重复成n_rep，不复制节省内存
 
+
+class Attention(nn.Module):
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        self.num_key_value_heads = config.num_attention_heads if config.num_key_value_heads is None \
+            else config.num_key_value_heads  # 如果config中有kv头数就用它，不然kv头数等于总注意力头数
+        self.n_local_heads = config.num_attention_heads  # 放在本地显存的头数
+        self.n_local_kv_heads = config.num_key_value_heads  # 放在本地显存的kv头
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads  # 一个kv对应几个q
+        self.head_dim = config.head_dim  # 注意力头维度
+        self.is_causal = True  # 使用因果注意力掩码、
+
+        # 注意力权重矩阵QKV，一般WQ是方阵 即heads_size = num_kv_value_heads * head_dim
+        # WK、WV和WQ的输出差一个n_rep的倍数
+        self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        # O矩阵，输入多头拼接结果，融合多头的特征，输出矩阵做残差连接，一般是方阵
+        self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=Fasle)
+        # 在算注意力分数前对q和k做标准化
+        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)  # 残差dropout
+        self.dropout = config.dropout
+
+        # 闪存式高效注意力，硬件优化
+        self.flash = hasattr(torch.nn.funtional, 'scaled_dot_product_attention') and config.flash_attn
+
+    def forward(self, x, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+        bsz, seq_len, _ = x.shape
+        # 算权重矩阵
+        xq = self.q_proj(x)
+        xk = self.k_proj(x)
+        xv = self.v_proj(x)
+        # 拆分为多头
+        xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        # 对qk标准化
+        xq = self.q_norm(xq)
+        xk = self.k_norm(xk)
+        # 位置编码
+        cos, sin = position_embeddings
+        xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
+
+        # 如果有kv缓存,就把缓存和当前的kv拼接
+        if past_key_value:
+            xk = torch.cat([past_key_value[0], xk], dim=1)
+            xv = torch.cat([past_key_value[1], xv], dim=1)
+        # 保存缓存
+        past_kv = (xk, xv) if use_cache else None
+
+        # 交换seq和head的维度，并把kv和q的头数对齐
+        xq = xq.transpose(1, 2)
+        xk = repeat_kv(xk, self.n_rep).transpose(1, 2)
+        xv = repeat_kv(xv, self.n_rep).transpose(1, 2)
+
+        # 如果用闪存式高效注意力
+        if self.flash and seq_len>1 and (not self.is_causal or past_key_value is None) \
+            and (attention_mask is None or torch.all(attention_mask == 1)):
+            output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout
+                                                    if self.training
+                                                    else 0.0, is_causal=self.is_causal)
+        else:   # 手动实现
+            scores = (xq @ xk.transpose(-2,-1))/math.sqrt(self.head_dim)    # q乘k转置除以维度的方根
+            # todo  没懂
+            if self.is_causal:
+                scores[:,:,:,-seq_len:] += torch.full((seq_len, seq_len), float('-inf'), device=scores.device).triu(1)
+            if attention_mask :
+                scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
+            output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
+        # 多头合并
+        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        output = self.o_proj(output)    # 融合
+        output = self.resid_dropout(output)     # dropout一下，准备残差
+        return output, past_kv
