@@ -232,10 +232,15 @@ class Attention(nn.Module):
 
         # 如果有kv缓存,就把缓存和当前的kv拼接
         if past_key_value:
-            xk = torch.cat([past_key_value[0], xk], dim=1)
+            xk = torch.cat([past_key_value[0], xk], dim=1)  # 在seq_len维度上拼接
             xv = torch.cat([past_key_value[1], xv], dim=1)
         # 保存缓存
         past_kv = (xk, xv) if use_cache else None
+
+        """
+        qk计算位置编码
+        kv做缓存，缓存已经完成位置编码的k
+        """
 
         # 交换seq和head的维度，并把kv和q的头数对齐
         xq = xq.transpose(1, 2)
@@ -297,7 +302,7 @@ class MiniMindBlock(nn.Module):
     out = h + MLP(RMSNorm(x)).
     MLP可以是FFN或者MOEFFN
     """
-    def __init__(self, layer_id: int, config: MiniMindConfig):
+    def __init__(self, layer_id: int, config: MiniMindConfig):  # layer_id: 当前层id
         super().__init__()
         self.self_attn = Attention(config)  # 自注意力层
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)     # 输入层归一化
@@ -324,5 +329,80 @@ class MiniMindBlock(nn.Module):
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
         return hidden_states, present_key_value # 返回隐藏状态和kv缓存
 
+
+# noinspection PyAttributeOutsideInit
 class MiniMindModel(nn.Module):
+    """
+    模型主干
+    输入词id输出隐藏层特征
+    input：ids -> 词嵌入向量 -> transformer层 * n -> output：RMSNorm
+    """
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        self.config = config
+        self.vocab_size = config.vocab_size     # 词表大小
+        self.num_hidden_layers = config.num_hidden_layers   # transformer层数
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        # 词嵌入向量 把词表映射成隐藏维度大小
+        # 定义Embedding类时，就创建了一张vocab_size * hidden_size的词向量表，跟随训练更新
+        self.dropout = nn.Dropout(config.dropout)
+        self.layers = nn.ModuleList([MiniMindBlock(i, config) for i in range(config.num_hidden_layers)])
+        # 把num_hidden_layers个transformer层堆叠起来
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)    # transformer循环后的层归一化
+        freqs_cos, freqs_sin = precompute_freqs_cid(dim=config.head_dim,    # 一个头的维度
+                                                    end=config.max_position_embeddings,     # 最大位置编码
+                                                    rope_base=config.rope_theta,    # rope的底数1000000
+                                                    rope_scaling=config.rope_scaling)    # rope的缩放
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)  # 把cos注册到模型跟随模型设备，但是没有梯度不参与更新
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)  # persistent=False 不存进权重
+
+    def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False, **kwargs):
+        batch_size, seq_length = input_ids.shape    # 传入批次和词id矩阵
+        if hasattr(past_key_values, 'layers'):
+            """
+            hasattr:如果past_key_values是有带有layers属性的对象则为true
+            训练的时候没有past_key_values，所以past_key_values总为none，这里做一个防御
+            推理的时候逐token生成，会生成一个带有layer属性的DynamicCache类，所以只有训练的时候有缓存
+            """
+            past_key_values = None
+        past_key_values = past_key_values or [None] * len(self.layers)  # 继承或初始化缓存，None是不可变对象
+        start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+        """past_key_values是保存每层kv对元组的元组，结构是(((k1),(v1)),((k2),(v2)),...)
+        past_key_values[0] = ((k1),(v1))  第一层的kv对
+        past_key_values[0][0] = (k1), k.shape = (bsz, seq_len, num_heads, head_dim)
+        seq_len是缓存的句子token的长度"""
+        hidden_states = self.dropout(self.embed_tokens(input_ids))  # 在词表中根据ids取向量
+        if self.freqs_cos[0, 0] == 0:
+            """
+            self.register_buffer("freqs_sin", freqs_sin, persistent=False),中persistent=False，正余弦表不保存
+            当模型后训练、微调等时，freqs_cos, freqs_sin会被置为0，所以重新计算正余弦表
+            """
+            freqs_cos, freqs_sin = precompute_freqs_cid(dim=self.config.head_dim,
+                                                        end=self.config.max_position_embeddings,
+                                                        rope_base=self.config.rope_theta,
+                                                        rope_scaling=self.config.rope_scaling)
+            self.freqs_cos = freqs_cos.to(hidden_states.device) # self.freqs_cos、sin已经在init中注册过，这里直接赋值
+            self.freqs_sin = freqs_sin.to(hidden_states.device)
+        postion_embeddings = (self.freqs_cos[start_pos:start_pos + seq_length],
+                              self.freqs_sin[start_pos:start_pos + seq_length]) # 只给新传入的token的位置编码器
+        persents = []   # 当前kv缓存
+        for layer, past_key_value in zip(self.layers, past_key_values): #循环多次transformer
+            hidden_states, present = layer(hidden_states,
+                                           postion_embeddings,
+                                           past_key_value=past_key_value,
+                                           use_cache=use_cache,
+                                           attention_mask=attention_mask)
+            persents.append(present)
+        hidden_states = self.RMSNorm(hidden_states)
+        aux_loss = None # MOE损失
+        return hidden_states, persents, aux_loss
+
+
+class MiniMindForCausalLM(nn.Module):
+    """
+    主干后面的功能头
+    训练：forward，生成：generate
+    输入隐藏层特征输出词（算loss）
+    input：rmsnorm -> 线性层 -> softmax -> 选词
+    """
     pass
