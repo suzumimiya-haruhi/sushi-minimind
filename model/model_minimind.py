@@ -405,4 +405,23 @@ class MiniMindForCausalLM(nn.Module):
     输入隐藏层特征输出词（算loss）
     input：rmsnorm -> 线性层 -> softmax -> 选词
     """
-    pass
+    config_class = MiniMindConfig
+    _tied_weights_keys = {"lm_head.weight": "embed_tokens.weight"}  # 共享嵌入层和输出层的词向量表
+    def __init__(self, config: MiniMindConfig=None):
+        self.config = config or MiniMindConfig()
+        super().__init__()
+        self.model = MiniMindModel(self.config)
+        self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        if self.config.tie_word_embeddings:
+            self.model.embed_tokens.weight = self.lm_head.weight
+        self.post_init()    # 递归初始化所有网络参数
+
+    def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False, labels=None, logits_to_keep=0, **kwargs):
+        hidden_states, past_key_values, aux_loss = self.model(input_ids, attention_mask=attention_mask, past_key_values=past_key_values, use_cache=use_cache, **kwargs)
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[..., slice_indices, :])
+        loss = None
+        if labels is not None:
+            x, y = logits[..., :-1, :].contiguous(), logits[..., 1:, :].contiguous()
+            loss = F.cross_entropy(x.view(-1, x.size(-1)), y.view(-1), ignore_index=-100)
+        return MoeCausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=past_key_values, aux_loss=aux_loss)
