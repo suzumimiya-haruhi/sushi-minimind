@@ -290,9 +290,48 @@ class FeedForward(nn.Module):
         return self.down_proj(self.up_proj(x) * self.act_fn(self.gate(x)))
 
 
-# todo MOEFFN
+# todo1 MOEFFN
 class MOEFeedForward(nn.Module):
-    pass
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        self.config = config
+        self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False) # 计算token走哪个专家
+        self.experts = nn.ModuleList([FeedForward(config, intermediate_size=config.moe_intermediate_size) for _ in range(config.num_experts)])
+        # 一个专家是一个完整的FFN
+        self.act_fn = ACT2FN[config.hidden_act] # 自动选择激活函数
+
+    def forward(self, x):
+        batch_size, seq_len, hidden_dim = x.shape
+        x_flat = x.view(-1, hidden_dim)     # 把batch和seq len压成一维，适配topk，x_flat.shape: [batch_size*seq_len, hidden_dim]
+        scores = F.softmax(self.gate(x_flat), dim=-1)    # 对每个token走哪个专家打分，形状：哪句的哪个token，对应的八个专家的概率
+        topk_weights, topk_idx = torch.topk(scores, k=self.config.num_experts_per_tok, dim=-1, sorted=False)
+        # num_experts_per_tok：每个token走几个专家，topk_weights：专家权重，topk_indices：专家id
+        # topk_weights, topk_indices 形状：[batch_size*seq_len, num_experts_per_tok]
+        if self.config.norm_topk_prob:  # 专家权重的归一化
+            topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+        y = torch.zeros_like(x_flat)    # return目标
+        for i, expert in enumerate(self.experts):   # 遍历每个专家，筛选需要经过这个专家的token
+            mask = (topk_idx == i) # 逐元素比较，筛选出哪些token走当前循环的专家
+            if mask.any():
+                token_idx = mask.any(dim=-1).nonzero().flatten()
+                # any(dim)压缩dim维度成bool
+                # nonzero()取True的下标，把稀疏变稠密
+                # flatten()直接拉平成一维，
+                weight = topk_weights[mask].view(-1, 1)
+                y.index_add_(0, token_idx, weight * expert(x_flat[mask]))
+            elif self.training:
+                # 如果在训练且没有token走这个专家，但是专家需要梯度更新，通过这一行把闲置专家拉进计算图
+                y[0, 0] += 0 * sum(p.sum() for p in expert.parameters())
+
+            if self.train and self.config.router_aux_loss_coef > 0: # 调整专家loss
+                load = F.one_hot(topk_idx, self.config.num_experts).float().mean(0)
+                # one hot:把稠密的专家id加一个维度变成独热，比如[0,2]->[[1,0,0,0,0,0,0,0],[0,0,1,0,0,0,0,0]]
+                # mean(0)求每个位置、每个专家的概率
+                self.aux_loss = (load * scores.mean(0)).sum() * self.config.num_experts * self.config.router_aux_loss_coef
+                # 通过广播把二维的load和一维的scores.mean(0)逐元素相乘，然后逐元素相加，再乘系数
+            else:
+                self.aux_loss = scores.new_zeros(1).squeeze()
+        return y.view(batch_size, seq_len, hidden_dim)
 
 
 class MiniMindBlock(nn.Module):
