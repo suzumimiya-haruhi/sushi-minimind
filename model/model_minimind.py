@@ -464,3 +464,67 @@ class MiniMindForCausalLM(nn.Module):
             x, y = logits[..., :-1, :].contiguous(), logits[..., 1:, :].contiguous()
             loss = F.cross_entropy(x.view(-1, x.size(-1)), y.view(-1), ignore_index=-100)
         return MoeCausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=past_key_values, aux_loss=aux_loss)
+
+    @torch.inference_mode()
+    def generate(self,
+                 inputs=None,   # 词表ids
+                 attention_mask=None,   # 标记padding的注意力掩码
+                 max_new_tokens=8192,   # 最大生成长度，大于此会被截断
+                 temperature=0.85,  # 温度
+                 top_p=0.85,    # 只取前累计85%
+                 top_k=50,      # 只取前50个
+                 eos_token_id=2,    # 结束符id
+                 streamer=None,     # 流式生成
+                 use_cache=True,    # 使用缓存
+                 num_return_sequences=1,    # 可生成多条回复，生图模型一般为4
+                 do_sample=True,            # 是否使用随机采样，为True时温度和toppk才生效
+                 repetition_penalty=1.0,    # 给重复输出惩罚，1无惩罚，>1重复token概率降低，<1鼓励重复
+                 **kwargs):
+
+        # 批量生成回复需要复制input
+        # input ids形状为[B, L],repeat在B上复制
+        input_ids = kwargs.pop("input_ids", inputs).repeat(num_return_sequences, 1)
+        attention_mask = attention_mask.repeat(num_return_sequences, 1) if attention_mask is not None else None
+
+        past_key_values = kwargs.pop("past_key_values", None)
+        finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+        # 用来监控batch中每句话是否生成结束，i句出现eos则finished[i]=true，完成的句子后面全部用padding填充
+        if streamer:
+            # 流式推送到cpu，input是提示词
+            streamer.put(input_ids.cpu())
+        for _ in range(max_new_tokens):
+            # token一批一批生成，每轮生成所有句子的同一个序号的token
+            past_len = past_key_values[0][0].shape[2] if past_key_values is not None else 0 # 取缓存
+            outputs = self.forward(input_ids[:, past_len:], attention_mask=attention_mask, past_key_values=past_key_values, use_cache=use_cache, **kwargs)
+            attention_mask = torch.cat([attention_mask, attention_mask.new_ones(attention_mask.shape[0], 1)], dim=1) if attention_mask is not None else None
+            # 给生成的这一批token加一个掩码形状[B,l]->[B,l+1]
+            # 注意力掩码旨在给长短不一的一批提示词掩码，输入到的长度一致，模型生成部分的掩码全为1，不管当句是否结束
+            logits = outputs.logits[:, -1, :] / temperature  # 句子中的最后一个token切片，算logits，一般带有缓存，这里只有一列token
+            #####################################################################
+            if repetition_penalty != 1.0:   # 给已经出现过token加惩罚，出现1次和100次的惩罚一样
+                for i in range(input_ids.shape[0]):
+                    seen = torch.unique(input_ids[i])   # 去重token集合
+                    score = logits[i, seen]
+                    logits[i, seen] = torch.where(score > 0, score / repetition_penalty, score * repetition_penalty)
+                    # 正数减小，负数更负
+            if top_k > 0:   # 只取topk
+                logits[logits < torch.topk(logits, top_k)[0][..., -1, None]] = -float('inf')
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                mask = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1) > top_p
+                mask[..., 1:], mask[..., 0] = mask[..., :-1].clone(), 0
+                logits[mask.scatter(1, sorted_indices, mask)] = -float('inf')
+            next_token = torch.multinomial(torch.softmax(logits, dim=-1), num_samples=1) if do_sample else torch.argmax(
+                logits, dim=-1, keepdim=True)
+            if eos_token_id is not None: next_token = torch.where(finished.unsqueeze(-1),
+                                                                  next_token.new_full((next_token.shape[0], 1),
+                                                                                      eos_token_id), next_token)
+            input_ids = torch.cat([input_ids, next_token], dim=-1)
+            past_key_values = outputs.past_key_values if use_cache else None
+            if streamer: streamer.put(next_token.cpu())
+            if eos_token_id is not None:
+                finished |= next_token.squeeze(-1).eq(eos_token_id)
+                if finished.all(): break
+        if streamer: streamer.end()
+        if kwargs.get("return_kv"): return {'generated_ids': input_ids, 'past_kv': past_key_values}
+        return input_ids
