@@ -20,4 +20,14 @@ class VLMConfig(MiniMindConfig):
         self.image_token_len = kwargs.get("image_token_len", 64)
         super().__init__(**kwargs)
 
-
+class MMVisionProjiector(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(in_dim),   # 视觉特征需要β对齐
+            nn.Linear(in_dim, out_dim),
+            nn.GELU(),
+            nn.Linear(out_dim, out_dim)
+        )
+    def forward(self,x):
+        return self.mlp(x)
