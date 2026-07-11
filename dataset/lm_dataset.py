@@ -16,7 +16,7 @@ class PretrainDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def __getitem__(self, index):
+    def __getitem__(self, index):   # getitem重载[index]
         sample = self.samples[index]    # dataloader循环调用，每次传入一个index
         tokens = self.tokenizer(sample['text'],
                                 add_special_token=False,
